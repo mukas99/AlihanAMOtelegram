@@ -24,6 +24,29 @@ AMO_H = {"Authorization": f"Bearer {AMO_ACCESS_TOKEN}"} if AMO_ACCESS_TOKEN else
 # ID кастомного поля «День обучений»
 CF_TRAINING_DAY_ID = os.getenv("CF_TRAINING_DAY_ID", "1057359")
 
+# кастомизаторы
+def pretty_label(k: str) -> str:
+    """Из 'День_обучений' делает 'День обучений'."""
+    s = (k or "").replace("_", " ").strip()
+    return s[:1].upper() + s[1:] if s else k
+
+def fmt_money_like(val) -> str:
+    """Если значение похоже на число — отформатируем разряды."""
+    try:
+        n = int(float(str(val).replace(" ", "").replace(",", ".")))
+        return f"{n:,}".replace(",", " ")
+    except Exception:
+        return str(val)
+
+def guess_emoji(label_lower: str) -> str:
+    L = label_lower
+    if any(w in L for w in ["бюдж", "сумм", "стоим", "price"]): return "💰"
+    if any(w in L for w in ["день", "date", "дата"]):           return "📅"
+    if any(w in L for w in ["ребен", "child", "ученик"]):        return "🧒"
+    if any(w in L for w in ["учител", "teacher", "тренер"]):     return "👩‍🏫"
+    if any(w in L for w in ["филиал", "branch"]):                return "🏢"
+    return "•"
+
 # Читать карты полей из .env
 def _load_json_env(name: str, default: dict):
     try:
@@ -43,20 +66,27 @@ def _norm(v):
         v = v[1:-1]
     return v
 
-def tg_send(text: str, parse_mode: str = "HTML"):
+def tg_send(text: str, parse_mode: str = "HTML", reply_markup=None):
     if not (TG_API and TELEGRAM_CHAT_ID):
         app.logger.warning("Telegram env vars not set; skip sending")
         return
     limit = 4096
+    first = True
     for i in range(0, len(text), limit):
         chunk = text[i:i+limit]
-        resp = requests.post(
-            TG_API,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": parse_mode, "disable_web_page_preview": True},
-            timeout=20
-        )
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True
+        }
+        if reply_markup and first:
+            payload["reply_markup"] = reply_markup
+            first = False
+        resp = requests.post(TG_API, json=payload, timeout=20)
         if resp.status_code >= 300:
             app.logger.error("Telegram send error: %s %s", resp.status_code, resp.text[:500])
+
 
 def amo_get(path, params=None):
     # (если у вас уже есть эта функция — оставьте свою)
@@ -185,30 +215,35 @@ def amocrm_stage_webhook():
         }
         enriched.append(item)
 
-        # === Telegram карточка ===
+        # === Telegram карточка (аккуратно и динамично) ===
+        title = html.escape(item["name"] or "Без названия")
+        lead_no = html.escape(str(lid))
+
         lines = [
-            f"✅ <b>Сделка</b> <code>{html.escape(str(lid))}</code>",
-            f"<b>{html.escape(item['name'] or 'Без названия')}</b>",
-            # f"Сумма: <b>{html.escape(str(item['price']))}</b>",
-            # f"Pipeline: <code>{html.escape(str(item['pipeline_id']))}</code> | Status: <code>{html.escape(str(item['status_id']))}</code>",
+            f"🧾 <b>{title}</b>",
+            f"№ <code>{lead_no}</code>",
+            "— — — — — — — — — —",
         ]
-        # добавим выбранные CF красиво
-        for k, v in lead_cf.items():
-            if isinstance(v, list):
-                v = ", ".join(map(str, v))
-            lines.append(f"{html.escape(k)}: <b>{html.escape(str(v or '—'))}</b>")
-        # контакт (кратко)
-        # if contacts_out:
-        #     c = contacts_out[0]
-        #     phones = ", ".join(c.get("phone", []) or c.get("phones", []) or [])
-        #     emails = ", ".join(c.get("email", []) or c.get("emails", []) or [])
-        #     lines.append(f"Контакт: <b>{html.escape(c.get('name') or '')}</b>"
-        #                  f"{' | 📞 ' + html.escape(phones) if phones else ''}"
-        #                  f"{' | ✉️ ' + html.escape(emails) if emails else ''}")
+
+        # выводим поля в порядке, как заданы в CF_FIELDS_JSON
+        for key in CF_FIELDS.keys():
+            v = lead_cf.get(key)
+            if v is None or (isinstance(v, str) and not v.strip()):
+                continue
+            label = pretty_label(key)
+            val = ", ".join(map(str, v)) if isinstance(v, list) else fmt_money_like(v)
+            emoji = guess_emoji(label.lower())
+            lines.append(f"{emoji} <b>{html.escape(label)}:</b> {html.escape(str(val))}")
+
+        # кнопка «Открыть в amoCRM» + дубль ссылки нижней строкой
+        kb = None
         if item["link"]:
+            kb = {"inline_keyboard": [[{"text": "🔗 Открыть в amoCRM", "url": item["link"]}]]}
+            lines.append("— — — — — — — — — —")
             lines.append(html.escape(item["link"]))
 
-        tg_send("\n".join(lines))
+        tg_send("\n".join(lines), reply_markup=kb)
+
     # итоговый JSON (для отладки)
     final = {"ok": True, "webhook_minimal": payload, "leads_full": enriched}
     # tg_send(f"<b>JSON:</b>\n<pre>{html.escape(json.dumps(final, ensure_ascii=False, indent=2))}</pre>")
